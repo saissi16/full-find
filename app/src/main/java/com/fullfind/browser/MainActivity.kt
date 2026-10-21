@@ -25,6 +25,7 @@ class MainActivity : Activity() {
     private lateinit var progress: ProgressBar
     private val tabs = mutableListOf<Page>()
     private var hasWebView = false
+    private var gecko: org.mozilla.geckoview.GeckoRuntime? = null
     private var cur = 0
     private val prefs by lazy { getSharedPreferences("ff", Context.MODE_PRIVATE) }
     private var desktop = false
@@ -37,11 +38,12 @@ class MainActivity : Activity() {
 
     private val web get() = tabs[cur]
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
-    private val home get() = prefs.getString("home", "https://www.google.com")!!
+    private val home get() = prefs.getString("home", null) ?: if (hasWebView || gecko != null) "https://www.google.com" else "https://html.duckduckgo.com/html/"
 
     override fun onCreate(b: Bundle?) {
         super.onCreate(b)
         hasWebView = Engine.webViewAvailable(this)
+        if (!hasWebView) { Net.start(applicationContext); gecko = Gecko.runtime(this) }
         root = FrameLayout(this).apply { setBackgroundColor(Color.BLACK) }
         container = FrameLayout(this)
         root.addView(container)
@@ -73,7 +75,12 @@ class MainActivity : Activity() {
     }
 
     private fun newTab(url: String, show: Boolean = true) {
-        val pg: Page = if (hasWebView) WebPage(this, cb, desktop) else TextPage(this, cb, desktop)
+        val g = gecko
+        val pg: Page = when {
+            hasWebView -> WebPage(this, cb, desktop)
+            g != null -> try { GeckoPage(this, cb, desktop, g) } catch (t: Throwable) { TextPage(this, cb, desktop) }
+            else -> TextPage(this, cb, desktop)
+        }
         tabs.add(pg)
         pg.loadUrl(url)
         if (show) switchTo(tabs.size - 1)
@@ -97,6 +104,7 @@ class MainActivity : Activity() {
     private fun clearCookies() {
         CookieJar.clear()
         if (hasWebView) { CookieManager.getInstance().removeAllCookies(null); WebStorage.getInstance().deleteAllData() }
+        if (gecko != null) Gecko.clearData(this)
     }
 
     private fun switchTo(i: Int) {
@@ -146,7 +154,7 @@ class MainActivity : Activity() {
         }
         web.loadUrl(url)
     }
-    private fun engine() = (if (!hasWebView && prefs.getString("engine", "Google") == "DuckDuckGo") "https://html.duckduckgo.com/html/?q=" else null) ?: engines[prefs.getString("engine", "Google")] ?: engines["Google"]!!
+    private fun engine() = (if (!hasWebView && gecko == null && prefs.getString("engine", "Google") == "DuckDuckGo") "https://html.duckduckgo.com/html/?q=" else null) ?: engines[prefs.getString("engine", "Google")] ?: engines["Google"]!!
 
     private fun showUrlBar() {
         val box = col()
@@ -251,7 +259,7 @@ class MainActivity : Activity() {
             clearCookies(); tabs.forEach { it.clear() }
             prefs.edit().remove("hist").remove("bm").apply(); toast("All data cleared")
         })
-        box.addView(TextView(this).apply { text = "Full Find 1.1 (" + (if (hasWebView) "WebView" else "Lite renderer") + ")\nTip: long-press ☁ for search"; textSize = 10f; gravity = Gravity.CENTER })
+        box.addView(TextView(this).apply { text = "Full Find 2.0 (" + (if (hasWebView) "WebView" else if (gecko != null) "GeckoView" else "Lite renderer") + ")\nTip: long-press ☁ for search"; textSize = 10f; gravity = Gravity.CENTER })
         d.show()
     }
 

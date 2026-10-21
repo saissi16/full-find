@@ -1,1 +1,5 @@
 -keep class com.fullfind.browser.** { *; }
+-keep class org.mozilla.** { *; }
+-dontwarn org.mozilla.**
+-dontwarn org.yaml.snakeyaml.**
+-dontwarn java.beans.**

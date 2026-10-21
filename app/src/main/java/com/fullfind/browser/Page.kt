@@ -5,12 +5,10 @@ import android.graphics.Color
 import android.net.Uri
 import android.os.Handler
 import android.os.Looper
-import android.text.Html
 import android.text.SpannableStringBuilder
 import android.text.Spanned
 import android.text.method.LinkMovementMethod
 import android.text.style.ClickableSpan
-import android.text.style.URLSpan
 import android.view.View
 import android.widget.ScrollView
 import android.widget.TextView
@@ -80,57 +78,66 @@ class TextPage(ctx: Context, private val cb: Callbacks, private var desktop: Boo
         val my = ++gen
         url = target; title = target
         cb.progress(this, 10)
+        val ctx = tv.context.applicationContext
         Thread {
             var result: CharSequence; var t = target; var finalUrl = target
+            var via = "?"
             try {
                 var u = URL(target); var conn: HttpURLConnection; var hops = 0
                 while (true) {
-                    conn = u.openConnection() as HttpURLConnection
-                    conn.instanceFollowRedirects = false; conn.connectTimeout = 15000; conn.readTimeout = 20000
-                    conn.setRequestProperty("User-Agent", ua)
-                    conn.setRequestProperty("Accept", "text/html,*/*;q=0.8")
-                    CookieJar.get(u.toString())?.let { conn.setRequestProperty("Cookie", it) }
+                    val r = Net.open(u) { c ->
+                        c.instanceFollowRedirects = false; c.connectTimeout = 20000; c.readTimeout = 20000
+                        c.setRequestProperty("User-Agent", ua)
+                        c.setRequestProperty("Accept", "text/html,application/xhtml+xml,*/*;q=0.8")
+                        c.setRequestProperty("Accept-Language", "en-US,en;q=0.9")
+                        c.setRequestProperty("Accept-Encoding", "gzip")
+                        CookieJar.get(u.toString())?.let { c.setRequestProperty("Cookie", it) }
+                    }
+                    conn = r.first; via = r.second
                     val code = conn.responseCode
                     conn.headerFields["Set-Cookie"]?.forEach { CookieJar.set(u.toString(), it) }
-                    if (code in 300..399 && hops++ < 8) { u = URL(u, conn.getHeaderField("Location")); conn.disconnect(); continue }
+                    if (code in 300..399 && hops++ < 10 && conn.getHeaderField("Location") != null) {
+                        u = URL(u, conn.getHeaderField("Location")); conn.disconnect(); continue
+                    }
                     break
                 }
                 finalUrl = u.toString()
+                val code = conn.responseCode
                 val mime = conn.contentType ?: "text/html"
-                if (!mime.startsWith("text/") && !mime.contains("xml")) {
+                if (!mime.startsWith("text/") && !mime.contains("xml") && !mime.contains("json")) {
                     val cd = conn.getHeaderField("Content-Disposition"); conn.disconnect()
                     ui.post { if (my == gen) { cb.progress(this, 100); cb.download(finalUrl, ua, cd, mime.substringBefore(';')) } }
                     return@Thread
                 }
-                val cs = Regex("charset=([\\w-]+)").find(mime)?.groupValues?.get(1) ?: "UTF-8"
                 ui.post { if (my == gen) cb.progress(this, 50) }
-                val bytes = (if (conn.responseCode >= 400) conn.errorStream else conn.inputStream)?.use { s ->
+                val bytes = Net.body(conn)?.use { s ->
                     val out = java.io.ByteArrayOutputStream(); val buf = ByteArray(16384)
-                    while (true) { val n = s.read(buf); if (n < 0 || out.size() > 3_000_000 || my != gen) break; out.write(buf, 0, n) }
+                    while (true) { val n = s.read(buf); if (n < 0 || out.size() > 4_000_000 || my != gen) break; out.write(buf, 0, n) }
                     out.toByteArray()
                 } ?: ByteArray(0)
-                var html = try { String(bytes, charset(cs)) } catch (_: Exception) { String(bytes) }
-                t = Regex("<title[^>]*>(.*?)</title>", setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL))
-                    .find(html)?.groupValues?.get(1)?.let { Html.fromHtml(it, 0).toString().trim() }?.ifBlank { null } ?: finalUrl
-                if (!mime.contains("html")) html = "<pre>" + Html.escapeHtml(html) + "</pre>"
-                html = html.replace(Regex("<(script|style|noscript|svg|head|template)[^>]*>.*?</\\1>", setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL)), "")
-                    .replace(Regex("<img[^>]*alt=\"([^\"]+)\"[^>]*>", RegexOption.IGNORE_CASE), "[$1] ")
-                val sp = SpannableStringBuilder(Html.fromHtml(html, Html.FROM_HTML_MODE_COMPACT))
-                val base = URL(finalUrl)
-                for (s in sp.getSpans(0, sp.length, URLSpan::class.java)) {
-                    val st = sp.getSpanStart(s); val en = sp.getSpanEnd(s); val href = s.url
-                    sp.removeSpan(s)
-                    val abs = try { URL(base, href).toString() } catch (_: Exception) { href }
+                conn.disconnect()
+                val headerCs = Regex("charset=([\\w-]+)", RegexOption.IGNORE_CASE).find(mime)?.groupValues?.get(1)
+                val cs = headerCs ?: HtmlLite.metaCharset(String(bytes, 0, minOf(bytes.size, 4096), Charsets.ISO_8859_1)) ?: "UTF-8"
+                val html = try { String(bytes, charset(cs)) } catch (_: Exception) { String(bytes, Charsets.UTF_8) }
+                val doc = if (mime.contains("html") || mime.contains("xml")) HtmlLite.parse(html, finalUrl) else HtmlLite.Doc(null, html, emptyList())
+                t = doc.title ?: finalUrl
+                val sp = SpannableStringBuilder(doc.text.ifBlank { "(Page loaded but has no readable text. It may need JavaScript.)\n\nHTTP $code, ${bytes.size} bytes via $via" })
+                for (l in doc.links) {
+                    if (l.end > sp.length) continue
+                    val abs = l.href
                     sp.setSpan(object : ClickableSpan() {
                         override fun onClick(w: View) {
                             val uri = Uri.parse(abs)
                             if (uri.scheme == "http" || uri.scheme == "https") loadUrl(abs) else cb.external(uri)
                         }
-                    }, st, en, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+                    }, l.start, l.end, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
                 }
-                result = sp.trim()
-            } catch (e: Exception) {
-                result = "Could not load page\n\n$target\n\n${e.javaClass.simpleName}: ${e.message}"
+                if (code >= 400) sp.insert(0, "HTTP $code\n\n")
+                result = sp
+            } catch (e: Throwable) {
+                val chain = generateSequence(e) { it.cause }.take(4).joinToString("\n← ") { "${it.javaClass.name}: ${it.message}" }
+                result = "Could not load page\n\n$target\n\n$chain\n\nNetwork: ${Net.status}; ${Net.describeDefault(ctx)}\nVia: $via"
+                android.util.Log.e("FullFind", "load failed $target", e)
             }
             ui.post {
                 if (my != gen) return@post
