@@ -23,13 +23,13 @@ class MainActivity : Activity() {
     private lateinit var root: FrameLayout
     private lateinit var container: FrameLayout
     private lateinit var progress: ProgressBar
-    private val tabs = mutableListOf<WebView>()
+    private val tabs = mutableListOf<Page>()
+    private var hasWebView = false
     private var cur = 0
     private val prefs by lazy { getSharedPreferences("ff", Context.MODE_PRIVATE) }
     private var desktop = false
     private var pendingInput: EditText? = null
     private val VOICE = 7
-    private val DESKTOP_UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
     private val engines = linkedMapOf(
         "Google" to "https://www.google.com/search?q=",
         "DuckDuckGo" to "https://duckduckgo.com/?q=",
@@ -41,7 +41,7 @@ class MainActivity : Activity() {
 
     override fun onCreate(b: Bundle?) {
         super.onCreate(b)
-        CookieManager.getInstance().setAcceptCookie(true)
+        hasWebView = Engine.webViewAvailable(this)
         root = FrameLayout(this).apply { setBackgroundColor(Color.BLACK) }
         container = FrameLayout(this)
         root.addView(container)
@@ -65,56 +65,45 @@ class MainActivity : Activity() {
 
     override fun onNewIntent(i: Intent) { super.onNewIntent(i); i.data?.let { newTab(it.toString()) } }
 
-    @SuppressLint("SetJavaScriptEnabled")
+    private val cb by lazy { Callbacks(
+        progress = { pg, p -> if (tabs.isNotEmpty() && pg === web) { progress.progress = p; progress.visibility = if (p < 100) View.VISIBLE else View.GONE } },
+        finished = { pg -> pg.url?.let { addHistory(pg.title ?: it, it) }; saveTabs() },
+        download = { u, ua, cd, mime -> download(u, ua, cd, mime) },
+        external = { uri -> try { startActivity(Intent(Intent.ACTION_VIEW, uri)) } catch (_: Exception) { toast("No app for link") } })
+    }
+
     private fun newTab(url: String, show: Boolean = true) {
-        val w = WebView(this)
-        w.settings.apply {
-            javaScriptEnabled = true; domStorageEnabled = true; databaseEnabled = true
-            builtInZoomControls = true; displayZoomControls = false; setSupportZoom(true)
-            useWideViewPort = true; loadWithOverviewMode = true
-            userAgentString = if (desktop) DESKTOP_UA else null
-        }
-        CookieManager.getInstance().setAcceptThirdPartyCookies(w, true)
-        w.isFocusable = true; w.isFocusableInTouchMode = true
-        w.webViewClient = object : WebViewClient() {
-            override fun shouldOverrideUrlLoading(v: WebView, r: WebResourceRequest): Boolean {
-                val s = r.url.scheme ?: return false
-                if (s == "http" || s == "https") return false
-                try { startActivity(Intent(Intent.ACTION_VIEW, r.url)) } catch (_: Exception) {}
-                return true
-            }
-            override fun onPageFinished(v: WebView, u: String) { addHistory(v.title ?: u, u); saveTabs() }
-        }
-        w.webChromeClient = object : WebChromeClient() {
-            override fun onProgressChanged(v: WebView, p: Int) {
-                if (v !== web) return
-                progress.progress = p; progress.visibility = if (p < 100) View.VISIBLE else View.GONE
-            }
-        }
-        w.setDownloadListener { url2, ua, cd, mime, _ ->
-            try {
-                val name = URLUtil.guessFileName(url2, cd, mime)
-                val req = DownloadManager.Request(Uri.parse(url2)).setMimeType(mime)
-                    .addRequestHeader("User-Agent", ua)
-                    .addRequestHeader("Cookie", CookieManager.getInstance().getCookie(url2) ?: "")
-                    .setTitle(name)
-                    .setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
-                    .setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, name)
-                (getSystemService(DOWNLOAD_SERVICE) as DownloadManager).enqueue(req)
-                toast("Downloading $name")
-            } catch (e: Exception) { toast("Download failed") }
-        }
-        w.loadUrl(url)
-        tabs.add(w)
+        val pg: Page = if (hasWebView) WebPage(this, cb, desktop) else TextPage(this, cb, desktop)
+        tabs.add(pg)
+        pg.loadUrl(url)
         if (show) switchTo(tabs.size - 1)
         saveTabs()
+    }
+
+    private fun download(url2: String, ua: String, cd: String?, mime: String?) {
+        try {
+            val name = URLUtil.guessFileName(url2, cd, mime)
+            val req = DownloadManager.Request(Uri.parse(url2)).setMimeType(mime)
+                .addRequestHeader("User-Agent", ua)
+                .setTitle(name)
+                .setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
+                .setDestinationInExternalFilesDir(this, Environment.DIRECTORY_DOWNLOADS, name)
+            cookie(url2)?.let { req.addRequestHeader("Cookie", it) }
+            (getSystemService(DOWNLOAD_SERVICE) as DownloadManager).enqueue(req)
+            toast("Downloading $name")
+        } catch (e: Exception) { toast("Download failed") }
+    }
+    private fun cookie(u: String): String? = if (hasWebView) CookieManager.getInstance().getCookie(u) else CookieJar.get(u)
+    private fun clearCookies() {
+        CookieJar.clear()
+        if (hasWebView) { CookieManager.getInstance().removeAllCookies(null); WebStorage.getInstance().deleteAllData() }
     }
 
     private fun switchTo(i: Int) {
         cur = i
         container.removeAllViews()
-        container.addView(web, -1, -1)
-        web.requestFocus()
+        container.addView(web.view, -1, -1)
+        web.view.requestFocus()
         saveTabs()
     }
 
@@ -157,7 +146,7 @@ class MainActivity : Activity() {
         }
         web.loadUrl(url)
     }
-    private fun engine() = engines[prefs.getString("engine", "Google")] ?: engines["Google"]!!
+    private fun engine() = (if (!hasWebView && prefs.getString("engine", "Google") == "DuckDuckGo") "https://html.duckduckgo.com/html/?q=" else null) ?: engines[prefs.getString("engine", "Google")] ?: engines["Google"]!!
 
     private fun showUrlBar() {
         val box = col()
@@ -196,7 +185,7 @@ class MainActivity : Activity() {
         item("◀ Back") { if (web.canGoBack()) web.goBack() }
         item("▶ Forward") { if (web.canGoForward()) web.goForward() }
         item("⟳ Reload") { web.reload() }
-        item("✕ Stop") { web.stopLoading() }
+        item("✕ Stop") { web.stop() }
         item("⌂ Home") { web.loadUrl(home) }
         item("🗂 Tabs (${tabs.size})") { showTabs() }
         item("＋ New tab") { newTab(home) }
@@ -212,7 +201,7 @@ class MainActivity : Activity() {
 
     private fun toggleDesktop() {
         desktop = !desktop; prefs.edit().putBoolean("desktop", desktop).apply()
-        tabs.forEach { it.settings.userAgentString = if (desktop) DESKTOP_UA else null; it.settings.loadWithOverviewMode = true }
+        tabs.forEach { it.setDesktop(desktop) }
         web.reload()
     }
 
@@ -256,15 +245,13 @@ class MainActivity : Activity() {
         }
         box.addView(btn("🗑 Clear history") { putList("hist", JSONArray()); toast("History cleared") })
         box.addView(btn("🗑 Clear cookies & cache") {
-            CookieManager.getInstance().removeAllCookies(null); WebStorage.getInstance().deleteAllData()
-            tabs.forEach { it.clearCache(true); it.clearFormData() }; toast("Browsing data cleared")
+            clearCookies(); tabs.forEach { it.clear() }; toast("Browsing data cleared")
         })
         box.addView(btn("🗑 Clear all data") {
-            CookieManager.getInstance().removeAllCookies(null); WebStorage.getInstance().deleteAllData()
-            tabs.forEach { it.clearCache(true); it.clearHistory() }
+            clearCookies(); tabs.forEach { it.clear() }
             prefs.edit().remove("hist").remove("bm").apply(); toast("All data cleared")
         })
-        box.addView(TextView(this).apply { text = "Full Find 1.0\nTip: long-press ☁ for search"; textSize = 10f; gravity = Gravity.CENTER })
+        box.addView(TextView(this).apply { text = "Full Find 1.1 (" + (if (hasWebView) "WebView" else "Lite renderer") + ")\nTip: long-press ☁ for search"; textSize = 10f; gravity = Gravity.CENTER })
         d.show()
     }
 
@@ -293,13 +280,13 @@ class MainActivity : Activity() {
     // ---- rotary crown scrolls page ----
     override fun dispatchGenericMotionEvent(e: MotionEvent): Boolean {
         if (e.action == MotionEvent.ACTION_SCROLL && e.isFromSource(InputDevice.SOURCE_ROTARY_ENCODER) && tabs.isNotEmpty()) {
-            web.scrollBy(0, (-e.getAxisValue(MotionEvent.AXIS_SCROLL) * dp(64)).toInt()); return true
+            web.scrollBy((-e.getAxisValue(MotionEvent.AXIS_SCROLL) * dp(64)).toInt()); return true
         }
         return super.dispatchGenericMotionEvent(e)
     }
 
     @Deprecated("Deprecated in Java")
     override fun onBackPressed() { if (web.canGoBack()) web.goBack() else super.onBackPressed() }
-    override fun onPause() { super.onPause(); CookieManager.getInstance().flush(); saveTabs() }
+    override fun onPause() { super.onPause(); if (hasWebView) CookieManager.getInstance().flush(); saveTabs() }
     override fun onDestroy() { tabs.forEach { it.destroy() }; super.onDestroy() }
 }
